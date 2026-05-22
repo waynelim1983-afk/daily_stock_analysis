@@ -124,17 +124,18 @@ def signal_b_bull_pullback(df: pd.DataFrame) -> pd.Series:
 
 def _vcp_contraction_check(df: pd.DataFrame, idx: int) -> bool:
     """
-    檢查 idx 位置是否滿足 VCP 震幅收縮條件（往前 60 根）。
-    把 60 日等分成 3 段，每段震幅比前段小至少 25%，最後段震幅 < 10%。
+    檢查 idx 位置之前 60 根（不含當日）是否滿足 VCP 震幅收縮條件。
+    把前 60 日等分成 3 段，每段震幅比前段小至少 20%，最後段震幅 < 15%。
+
+    注意：窗口不包含 idx 當日，避免突破K棒的高點干擾段幅計算。
     """
-    start = idx - 59
-    if start < 0:
+    if idx < 60:
         return False
     segment_len = 20  # 60 / 3
     amplitudes = []
     for seg in range(3):
-        s = start + seg * segment_len
-        e = s + segment_len
+        s = idx - 60 + seg * segment_len   # 最舊段從 idx-60 開始
+        e = s + segment_len                 # 最新段結束於 idx-20+20 = idx（不含）
         seg_data = df.iloc[s:e]
         if seg_data.empty:
             return False
@@ -144,13 +145,13 @@ def _vcp_contraction_check(df: pd.DataFrame, idx: int) -> bool:
         amp = (seg_data["high"].max() - seg_data["low"].min()) / mid_close
         amplitudes.append(amp)
 
-    # 每段震幅需比前段小至少 25%
+    # 每段震幅需比前段小至少 20%（放寬自 25%）
     for i in range(1, len(amplitudes)):
-        if amplitudes[i] >= amplitudes[i - 1] * 0.75:
+        if amplitudes[i] >= amplitudes[i - 1] * 0.80:
             return False
 
-    # 最後一段震幅需 < 10%
-    if amplitudes[-1] >= 0.10:
+    # 最後一段震幅需 < 15%（放寬自 10%）
+    if amplitudes[-1] >= 0.15:
         return False
 
     return True
@@ -159,8 +160,8 @@ def _vcp_contraction_check(df: pd.DataFrame, idx: int) -> bool:
 def signal_c_vcp(df: pd.DataFrame) -> pd.Series:
     """
     策略C：VCP（波動收縮形態）
-    - 近 60 日分 3 段，每段震幅比前段小至少 25%
-    - 最後一段震幅 < 10%
+    - 突破日前 60 日分 3 段，每段震幅比前段小至少 20%
+    - 最後一段震幅 < 15%
     - 收盤在 MA200 之上
     - 成交量 > 20日均量 × 1.5
     - 收盤突破近 60 日最高點
@@ -271,10 +272,11 @@ def compute_metrics(trades: list[dict]) -> dict:
     avg_win  = float(np.mean(wins)) if wins else 0.0
     avg_loss = float(np.mean(losses)) if losses else 0.0
 
-    # 最大回撤：用累積損益序列計算
-    cumulative = np.cumsum(pnls)
-    peak = np.maximum.accumulate(cumulative)
-    drawdown = cumulative - peak
+    # 最大回撤：用複利權益曲線計算（結果恆在 [-100%, 0%] 內）
+    # np.cumsum 直接加總百分比會超過 -100%，須改用乘積模擬資金曲線
+    equity = np.cumprod(1 + np.array(pnls))
+    peak = np.maximum.accumulate(equity)
+    drawdown = (equity - peak) / peak
     max_drawdown = float(np.min(drawdown)) if len(drawdown) > 0 else 0.0
 
     # 夏普比率：(年化平均報酬 - 0.02) / 年化標準差
