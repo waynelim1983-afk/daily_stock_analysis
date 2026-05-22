@@ -1,0 +1,177 @@
+name: 台股策略回測
+
+on:
+  # 手動觸發（主要入口）
+  workflow_dispatch:
+    inputs:
+      strategies:
+        description: '回測策略（逗號分隔，A/B/C）'
+        required: false
+        default: 'A,B,C'
+        type: string
+      min_volume_lots:
+        description: '最低日均量（張，1張=1000股）'
+        required: false
+        default: '500'
+        type: string
+
+  # 每週六台灣時間 09:00（UTC 01:00）定時執行
+  schedule:
+    - cron: '0 1 * * 6'
+
+concurrency:
+  group: tw-backtest
+  cancel-in-progress: true
+
+jobs:
+  backtest:
+    name: 台股全市場回測
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # 全市場 ~900 支，預留足夠時間
+
+    steps:
+      - name: 檢出代碼
+        uses: actions/checkout@v5
+
+      - name: 設置 Python 環境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝回測依賴
+        run: |
+          pip install --upgrade pip
+          pip install "numpy>=1.26" "pandas>=2.1" "yfinance>=0.2.38" "akshare>=1.12"
+
+      - name: 執行回測
+        id: run_backtest
+        run: |
+          STRATEGIES="${{ github.event.inputs.strategies || 'A,B,C' }}"
+          MIN_LOTS="${{ github.event.inputs.min_volume_lots || '500' }}"
+          MIN_SHARES=$(( MIN_LOTS * 1000 ))
+
+          echo "策略：$STRATEGIES"
+          echo "最低日均量：${MIN_LOTS} 張（${MIN_SHARES} 股）"
+
+          python scripts/backtest_tw_strategies.py \
+            --strategy "$STRATEGIES" \
+            --min-volume "$MIN_SHARES" \
+            --json-out backtest_result.json \
+            2>&1 | tee backtest_output.txt
+
+      - name: 上傳回測報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report-${{ github.run_id }}
+          path: |
+            backtest_output.txt
+            backtest_result.json
+          retention-days: 30
+
+      - name: 推送結果至 Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          BACKTEST_STATUS: ${{ steps.run_backtest.outcome }}
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          import urllib.request
+
+          token    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id  = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+          thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+          status   = os.environ.get("BACKTEST_STATUS", "unknown")
+
+          if not token or not chat_id:
+              print("TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未設定，跳過推送")
+              sys.exit(0)
+
+          def esc(s: str) -> str:
+              """HTML 模式只需跳脫 &、<、>。"""
+              return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+          # 讀取 JSON 回測結果
+          result_path = "backtest_result.json"
+          if not os.path.exists(result_path):
+              # 回測未完成或失敗，傳送失敗通知
+              text = (
+                  "❌ <b>台股策略回測失敗</b>\n\n"
+                  f"狀態：{esc(status)}\n"
+                  "請至 GitHub Actions 查看詳細日誌。"
+              )
+          else:
+              with open(result_path, encoding="utf-8") as f:
+                  data = json.load(f)
+
+              lines = [
+                  "📊 <b>台股策略回測結果</b>",
+                  "",
+                  f"📅 回測期間：{esc(data['start_date'])} ~ {esc(data['end_date'])}",
+                  f"🏦 有效股票：{data['valid_count']} 支（日均量 ≥ 500 張）",
+                  "",
+              ]
+
+              icons = {"A": "📈", "B": "📉", "C": "🌀"}
+              for key, m in data.get("strategies", {}).items():
+                  icon = icons.get(key, "📊")
+                  lines.append(f"{icon} <b>策略{esc(key)}：{esc(m['name'])}</b>")
+                  if m.get("count", 0) == 0:
+                      lines.append("  <i>（回測期間內無交易訊號）</i>")
+                  else:
+                      sign_pnl = "+" if m["avg_pnl"] >= 0 else ""
+                      sign_win = "+" if m["avg_win"] >= 0 else ""
+                      sign_los = "+" if m["avg_loss"] >= 0 else ""
+                      lines += [
+                          f"  交易次數：{m['count']}",
+                          f"  勝率：{m['win_rate'] * 100:.1f}%",
+                          f"  平均損益：{sign_pnl}{m['avg_pnl'] * 100:.2f}%",
+                          f"  平均獲利：{sign_win}{m['avg_win'] * 100:.2f}%",
+                          f"  平均虧損：{sign_los}{m['avg_loss'] * 100:.2f}%",
+                          f"  最大回撤：{m['max_drawdown'] * 100:.2f}%",
+                          f"  夏普比率：{m['sharpe']:.2f}",
+                      ]
+                  lines.append("")
+
+              lines += [
+                  "─" * 28,
+                  "💡 <i>進場：訊號日隔日開盤",
+                  "出場：持有 20 日或觸及 -7% 停損</i>",
+              ]
+              text = "\n".join(lines)
+
+          # Telegram 單則訊息上限 4096 字元
+          if len(text) > 4090:
+              text = text[:4087] + "..."
+
+          payload = {
+              "chat_id": chat_id,
+              "text": text,
+              "parse_mode": "HTML",
+          }
+          if thread_id:
+              payload["message_thread_id"] = int(thread_id)
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  result = json.loads(resp.read())
+              if result.get("ok"):
+                  print("✅ Telegram 推送成功")
+              else:
+                  print(f"❌ Telegram API 回傳錯誤：{result}")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ Telegram 請求失敗：{e}")
+              sys.exit(1)
+          PYEOF

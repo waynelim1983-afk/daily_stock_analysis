@@ -430,6 +430,13 @@ def parse_args() -> argparse.Namespace:
         default=500_000,
         help="最低 20 日均量（股數，預設：500000，即 500 張）",
     )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="將回測結果摘要寫入 JSON 檔案（供 CI/通知腳本讀取）",
+    )
     return parser.parse_args()
 
 
@@ -468,3 +475,20 @@ if __name__ == "__main__":
         start_date=start_date,
         end_date=end_date,
     )
+
+    if args.json_out:
+        import json as _json
+        summary = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "valid_count": valid_count,
+            "strategies": {},
+        }
+        for key in valid_keys:
+            name, _ = STRATEGIES[key]
+            m = compute_metrics(all_trades[key])
+            m["name"] = name
+            summary["strategies"][key] = m
+        with open(args.json_out, "w", encoding="utf-8") as _f:
+            _json.dump(summary, _f, ensure_ascii=False, indent=2)
+        print(f"\n回測摘要已寫入：{args.json_out}")
