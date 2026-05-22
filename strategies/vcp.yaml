@@ -1,0 +1,49 @@
+# VCP Strategy / 波動收縮形態（VCP）
+# Volatility Contraction Pattern，由 Mark Minervini 提出。
+
+name: vcp
+display_name: 波動收縮形態（VCP）
+description: 偵測股價經過多次震幅收縮整理後的突破訊號，由 Mark Minervini 提出。
+category: trend
+core_rules: [1, 2, 3, 4]
+required_tools:
+  - get_daily_history
+  - analyze_trend
+aliases: [VCP, 波動收縮, 缩量收敛]
+default_priority: 25
+market_regimes: [trending_up]
+
+instructions: |
+  **波動收縮形態（VCP，Volatility Contraction Pattern）**
+
+  訊號判定標準：
+
+  1. **震幅收縮偵測**（核心條件）：
+     - 使用 `get_daily_history` 取得近 40–60 個交易日的日線資料。
+     - 將此區間劃分成數段，識別至少 3 次明顯的回踩收縮週期。
+     - 每次回踩的幅度（從局部高點到局部低點的跌幅）必須比上一次小至少 25%。
+     - 範例：第一次收縮 15%，第二次 ≤ 11.25%（15% × 0.75），第三次 ≤ 8.44%（11.25% × 0.75）。
+     - 震幅持續縮小，代表浮籌逐步洗清、賣壓逐漸消化。
+
+  2. **突破確認**（入場觸發）：
+     - 股價向上突破最後一次收縮區間的高點（即整個 VCP 形態的頸線）。
+     - 突破日的成交量必須 > 20 日均量 × 1.5 倍，確認主力資金介入。
+     - 使用 `get_daily_history` 驗證量能條件。
+     - 突破後若縮量回踩頸線附近而未跌破，可視為二次買點。
+
+  3. **趨勢背景**（長期多頭結構）：
+     - 使用 `analyze_trend` 確認股價位於 200 日均線（MA200）之上。
+     - MA200 向上傾斜為最佳狀態，代表長期多頭趨勢健全。
+     - 若股價低於 MA200，即使出現收縮形態，訊號可靠性大幅降低，不建議進場。
+
+  4. **最後一次收縮要夠緊**（拋壓充分消化）：
+     - 最後一段（第三次或最後一次）回踩幅度須 < 10%。
+     - 震幅愈小、時間愈短，代表籌碼愈趨穩定，突破後爆發力愈強。
+     - 若最後收縮幅度仍 ≥ 10%，形態尚未成熟，應繼續等待。
+
+  評分調整建議：
+  - 完整 VCP 形態（3 次以上收縮）+ 放量突破 MA200 之上：sentiment_score +15
+  - 僅 2 次收縮或突破量能不足（量比 < 1.5）：sentiment_score +8
+  - 股價位於 MA200 之下：sentiment_score -10
+  - 在 `buy_reason` 中注明「VCP突破」，並記錄收縮次數與最後一次收縮幅度。
+  - 理想買點設於突破頸線時，停損設於最後一次收縮低點下方。
