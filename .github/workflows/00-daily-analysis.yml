@@ -1,9 +1,9 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发 - 每天台湾时间 16:00 (UTC 08:00)
   schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+    - cron: '0 8 * * 1-5'      # 周一到周五，UTC 08:00 = 台湾时间 16:00
   
   # 手动触发
   workflow_dispatch:
@@ -364,10 +364,19 @@ jobs:
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
+          # 实时行情：默认 false（GitHub Actions 环境中国数据源不稳定）
+          ENABLE_REALTIME_QUOTE: ${{ vars.ENABLE_REALTIME_QUOTE || secrets.ENABLE_REALTIME_QUOTE || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+          # 数据源优先级（低数字 = 高优先级）
+          # 台股/美股场景：yfinance(0) 优先；中国数据源设高值避免无效 timeout
+          YFINANCE_PRIORITY: ${{ vars.YFINANCE_PRIORITY || '0' }}
+          EFINANCE_PRIORITY: ${{ vars.EFINANCE_PRIORITY || '99' }}
+          AKSHARE_PRIORITY: ${{ vars.AKSHARE_PRIORITY || '99' }}
+          PYTDX_PRIORITY: ${{ vars.PYTDX_PRIORITY || '99' }}
+          BAOSTOCK_PRIORITY: ${{ vars.BAOSTOCK_PRIORITY || '99' }}
           
         run: |
           # 处理 LITELLM YAML 配置文件
