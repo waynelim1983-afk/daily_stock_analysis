@@ -28,19 +28,53 @@ FALLBACK_TW_STOCKS = [
 ]
 
 
+def _fetch_twse_listed_codes() -> list[str]:
+    """從 TWSE ISIN 公開頁面抓取上市股票代號（不依賴 akshare）。"""
+    import re
+    import urllib.request
+
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("big5", errors="replace")
+    # 表格欄位格式：「1101　台泥」，取 4 位數字代碼
+    codes = re.findall(r"(\d{4})　[一-鿿\w]", html)
+    codes = list(dict.fromkeys(codes))  # 去重保序
+    return codes
+
+
 def get_tw_stock_list() -> list[str]:
-    """取得台股上市股票代號清單（優先用 akshare，失敗改用備用清單）。"""
+    """
+    取得台股上市股票代號清單，來源優先順序：
+      1. akshare stock_info_tw_name_code（上市）
+      2. TWSE ISIN 公開頁面（不依賴第三方套件）
+      3. 腳本內備用清單（60 支，僅作最後防線）
+    """
+    # 路徑 1：akshare
     try:
         import akshare as ak  # type: ignore
         df = ak.stock_info_tw_name_code(indicator="上市")
         codes = df.iloc[:, 0].astype(str).tolist()
         codes = [c.strip() for c in codes if c.strip().isdigit()]
         if len(codes) >= 50:
-            print(f"[akshare] 取得台股上市清單：{len(codes)} 支")
+            print(f"[清單來源] akshare：取得 {len(codes)} 支上市股票")
             return codes
-        print(f"[akshare] 清單不足（{len(codes)} 支），改用備用清單")
+        print(f"[清單來源] akshare 回傳不足（{len(codes)} 支），嘗試 TWSE 官方頁面")
     except Exception as e:
-        print(f"[akshare] 取得清單失敗：{e}，改用備用清單")
+        print(f"[清單來源] akshare 失敗（{e}），嘗試 TWSE 官方頁面")
+
+    # 路徑 2：TWSE 官方 ISIN 頁面
+    try:
+        codes = _fetch_twse_listed_codes()
+        if len(codes) >= 50:
+            print(f"[清單來源] TWSE ISIN 頁面：取得 {len(codes)} 支上市股票")
+            return codes
+        print(f"[清單來源] TWSE ISIN 頁面回傳不足（{len(codes)} 支），使用備用清單")
+    except Exception as e:
+        print(f"[清單來源] TWSE ISIN 頁面失敗（{e}），使用備用清單")
+
+    # 路徑 3：腳本內備用清單
+    print(f"[清單來源] 備用清單：{len(FALLBACK_TW_STOCKS)} 支（僅大型股，非全市場）")
     return list(FALLBACK_TW_STOCKS)
 
 
@@ -48,20 +82,25 @@ def get_tw_stock_list() -> list[str]:
 # 資料下載
 # ---------------------------------------------------------------------------
 
-def download_history(code: str, start: str, end: str) -> pd.DataFrame | None:
-    """下載 yfinance 日線資料，失敗回傳 None。"""
+def download_history(code: str, start: str, end: str) -> tuple["pd.DataFrame | None", "str | None"]:
+    """
+    下載 yfinance 日線資料。
+    回傳 (DataFrame, None) 成功，或 (None, 錯誤原因字串) 失敗。
+    """
     ticker = f"{code}.TW"
     try:
         df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-        if df.empty or len(df) < 60:
-            return None
+        if df.empty:
+            return None, "yfinance 無回傳資料"
+        if len(df) < 60:
+            return None, f"資料筆數不足（{len(df)} 筆 < 60 筆）"
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.columns = ["open", "high", "low", "close", "volume"]
         df.index = pd.to_datetime(df.index)
         df.sort_index(inplace=True)
-        return df
-    except Exception:
-        return None
+        return df, None
+    except Exception as e:
+        return None, str(e)[:120]
 
 
 # ---------------------------------------------------------------------------
@@ -314,30 +353,40 @@ def run_backtest(
     min_volume: int,
     start_date: str,
     end_date: str,
-) -> dict[str, list[dict]]:
-    """對所有台股執行回測，回傳各策略的交易清單。"""
+) -> tuple[dict, int, dict]:
+    """
+    對所有台股執行回測。
+    回傳 (all_trades, valid_count, skip_stats)。
+    skip_stats = {"download_fail": [...], "low_volume": int}
+    """
     codes = get_tw_stock_list()
     all_trades: dict[str, list[dict]] = {k: [] for k in strategy_keys}
 
     total = len(codes)
     valid_count = 0
-    skipped_count = 0
+    low_volume_count = 0
+    download_failures: list[tuple[str, str]] = []  # (code, reason)
 
     print(f"\n開始下載資料並回測，共 {total} 支股票...\n")
 
     for idx, code in enumerate(codes, 1):
         if idx % 10 == 0 or idx == total:
-            print(f"  進度：{idx}/{total}（有效：{valid_count}，跳過：{skipped_count}）")
+            print(
+                f"  進度：{idx}/{total}  "
+                f"有效：{valid_count}  "
+                f"下載失敗：{len(download_failures)}  "
+                f"量能不足：{low_volume_count}"
+            )
 
-        df = download_history(code, start_date, end_date)
+        df, err = download_history(code, start_date, end_date)
         if df is None:
-            skipped_count += 1
+            download_failures.append((code, err or "未知錯誤"))
             continue
 
         # 過濾低流動性（20日均量 < min_volume 股）
         avg_vol = avg_daily_volume_shares(df)
         if avg_vol < min_volume:
-            skipped_count += 1
+            low_volume_count += 1
             continue
 
         df = compute_indicators(df)
@@ -349,12 +398,29 @@ def run_backtest(
                 signals = signal_fn(df)
                 trades = simulate_trades(df, signals)
                 all_trades[key].extend(trades)
-            except Exception as e:
-                # 單一策略/股票錯誤不中斷整體
+            except Exception:
                 pass
 
-    print(f"\n篩選完成：有效股票 {valid_count} 支，跳過 {skipped_count} 支\n")
-    return all_trades, valid_count
+    skip_stats = {
+        "download_fail": download_failures,
+        "low_volume": low_volume_count,
+    }
+
+    print(f"\n{'─'*50}")
+    print(f"篩選結果摘要（共 {total} 支股票）")
+    print(f"  ✅ 有效（進入回測）：{valid_count} 支")
+    print(f"  ❌ 下載失敗：       {len(download_failures)} 支")
+    print(f"  📉 量能不足（< {min_volume//1000} 張）：{low_volume_count} 支")
+
+    if download_failures:
+        print(f"\n  下載失敗清單（前 20 支）：")
+        for code, reason in download_failures[:20]:
+            print(f"    {code}.TW  →  {reason}")
+        if len(download_failures) > 20:
+            print(f"    … 另 {len(download_failures) - 20} 支（略）")
+    print(f"{'─'*50}\n")
+
+    return all_trades, valid_count, skip_stats
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +529,7 @@ if __name__ == "__main__":
     print(f"最低成交量篩選：{args.min_volume:,} 股（{args.min_volume // 1000} 張）")
     print(f"回測期間：{start_date} ~ {end_date}")
 
-    all_trades, valid_count = run_backtest(
+    all_trades, valid_count, skip_stats = run_backtest(
         strategy_keys=valid_keys,
         min_volume=args.min_volume,
         start_date=start_date,
@@ -484,6 +550,8 @@ if __name__ == "__main__":
             "start_date": start_date,
             "end_date": end_date,
             "valid_count": valid_count,
+            "download_fail_count": len(skip_stats["download_fail"]),
+            "low_volume_count": skip_stats["low_volume"],
             "strategies": {},
         }
         for key in valid_keys:
